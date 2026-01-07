@@ -1,11 +1,19 @@
-# .github/workflows/docker-publish.yml
 
 name: 🚀 Build, Publish & Deploy Frontend
 
 on:
   push:
-    branches:
-      - master
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-frontend-main
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: jayirong/app-frontend-dyc
+  CONTAINER_NAME: frontend
+
 jobs:
   build-push:
     name: 🛠️ Build & Push Docker Image
@@ -14,31 +22,33 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install dependencies
-        run: npm ci -- --legacy-peer-deps
-
-      - name: Build Angular (production)
-        run: npm run build -- --configuration production
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Docker metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+
       - name: Build & push Docker image
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            jayirong/app-frontend-dyc:latest
-            jayirong/app-frontend-dyc:${{ github.sha }}
+          tags:  ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
     name: 🚀 Deploy to EC2
@@ -46,31 +56,39 @@ jobs:
     needs: build-push
     steps:
       - name: Start SSH agent
-        uses: webfactory/ssh-agent@v0.5.4
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
 
       - name: Pull & run on EC2
         run: |
-          ssh -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
-            # 0) Para el Nginx de host para liberar el 80/443
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+
+            # 0) Si el host tiene nginx ocupando 80/443, lo bajas.
             sudo systemctl stop nginx || true
             sudo systemctl disable nginx || true
 
             # 1) Pull latest image
-            docker pull jayirong/app-frontend-dyc:latest
+            docker pull ${IMAGE_NAME}:latest
 
             # 2) Stop & remove existing container
-            docker stop frontend  || true
-            docker rm   frontend  || true
+            docker stop ${CONTAINER_NAME} || true
+            docker rm   ${CONTAINER_NAME} || true
 
-            # 3) Run new container, montando certificados para HTTPS
+            # 3) Run new container (HTTPS certs mounted)
             docker run -d \
-              --name frontend \
+              --name ${CONTAINER_NAME} \
               --restart unless-stopped \
               -p 80:80 \
               -p 443:443 \
               -v /etc/letsencrypt:/etc/letsencrypt:ro \
               -v /var/lib/letsencrypt:/var/lib/letsencrypt:ro \
-              jayirong/app-frontend-dyc:latest
+              ${IMAGE_NAME}:latest
+
+            # 4) Limpieza opcional
+            docker image prune -f || true
           EOF
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
